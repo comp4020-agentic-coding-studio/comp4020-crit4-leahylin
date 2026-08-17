@@ -2,19 +2,24 @@
 import Layout from "../layouts/Layout.astro";
 ---
 
-<Layout title="COMP4020 prototype">
-  <header>
+<Layout title="Constellation Composer">
+  <header class="visually-hidden">
     <nav aria-label="Primary">
-      <a href="./">Home</a>
+      <a href="./">Constellation Composer</a>
     </nav>
   </header>
   <main>
-    <h1>COMP4020 prototype</h1>
-    <p data-testid="intro">
-      Replace this with your prototype. This week's brief is on the course
-      website; <code>spec/README.md</code> explains how the checks in this repo
-      relate to it.
-    </p>
+    <h1 class="visually-hidden">Constellation Composer</h1>
+    <div
+      id="sky"
+      aria-label="Night sky. Click or tab to a star, then another, to connect them into a constellation that plays as a repeating melody. Drag a star, or use arrow keys on a focused star, to change its note. Drag across empty sky for a shooting-star melody."
+    >
+      <svg id="lines" aria-hidden="true"></svg>
+      <p id="hint">click, tap, or tab to a star — then another, to connect them</p>
+    </div>
+    <div class="controls">
+      <button id="clear" type="button">Clear constellation</button>
+    </div>
   </main>
   <script src="../scripts/main.ts"></script>
 </Layout>

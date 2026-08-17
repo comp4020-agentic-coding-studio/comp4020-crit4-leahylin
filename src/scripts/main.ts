@@ -549,7 +549,6 @@ function handleHoverMelody(e: PointerEvent): void {
     const dt = performance.now() - lastMeteorPoint.time;
     if (dist >= SHOOT_MIN_DIST || dt >= SHOOT_MIN_MS) {
       drawTrailSegment(lastMeteorPoint.x, lastMeteorPoint.y, x, y);
-      dismissHint();
       if (audioCtx) pluckAt(x, y, HOVER_VOLUME);
       lastMeteorPoint = { x, y, time: performance.now() };
     }

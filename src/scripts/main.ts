@@ -1,6 +1,7 @@
 // Constellation Composer: click stars to connect them into a chain, which
 // loops as a melody; drag a star (or arrow-key it while focused) to change
-// its note; drag across empty sky for a one-off shooting-star melody.
+// its note; hover the sky with no button held for an ambient drone plus a
+// shooting-star trail wherever the cursor sweeps.
 // Every vertical position quantizes to a pentatonic scale, so there is no
 // note — and no constellation shape — that can ever sound "wrong".
 
@@ -55,6 +56,21 @@ function brightnessFor(size: number): number {
   return clamp((size - 0.4) / 0.8, 0, 1);
 }
 
+// Timbre by height, independent of size: top of the sky rings clear and
+// bell-like, the bottom sits warm and dark — layered on top of brightness
+// rather than replacing it.
+function clarityFor(y: number): number {
+  return 1 - clamp(y / skyRect.height, 0, 1);
+}
+
+function durationFor(size: number): number {
+  return 130 + brightnessFor(size) * 520;
+}
+
+function fadeFor(size: number): number {
+  return 160 + brightnessFor(size) * 480;
+}
+
 let audioCtx: AudioContext | null = null;
 let master: GainNode | null = null;
 
@@ -71,6 +87,14 @@ function ensureAudio(): { ctx: AudioContext; master: GainNode } {
   return { ctx: audioCtx, master };
 }
 
+// Browsers refuse to start an AudioContext from a bare pointermove — some
+// prior click/tap/keypress has to unlock it first. That gesture doesn't have
+// to land on a star though: any first interaction anywhere on the page
+// counts, so a single stray click is enough to make hover alone play sound
+// from then on.
+window.addEventListener("pointerdown", () => ensureAudio(), { once: true });
+window.addEventListener("keydown", () => ensureAudio(), { once: true });
+
 // A single note: oscillator -> lowpass filter -> stereo panner -> its own
 // gain envelope -> the shared master bus. `pluck` is for taps/keys/shooting
 // stars (self-releasing); `update`/`release` are for the held preview tone
@@ -80,6 +104,8 @@ class Voice {
   private filter: BiquadFilterNode;
   private panner: StereoPannerNode;
   private gain: GainNode;
+  private analyser: AnalyserNode;
+  private levelBuffer: Uint8Array<ArrayBuffer>;
 
   constructor(
     private ctx: AudioContext,
@@ -87,6 +113,8 @@ class Voice {
     frequency: number,
     pan: number,
     brightness: number,
+    clarity = 0,
+    volume = 1,
   ) {
     this.osc = ctx.createOscillator();
     this.osc.type = "triangle";
@@ -94,7 +122,7 @@ class Voice {
 
     this.filter = ctx.createBiquadFilter();
     this.filter.type = "lowpass";
-    this.filter.frequency.value = 400 + brightness * 4000;
+    this.filter.frequency.value = 350 + brightness * 1900 + clarity * 2500;
     this.filter.Q.value = 0.7;
 
     this.panner = ctx.createStereoPanner();
@@ -103,19 +131,37 @@ class Voice {
     this.gain = ctx.createGain();
     this.gain.gain.value = 0;
 
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = 32;
+    this.levelBuffer = new Uint8Array(this.analyser.frequencyBinCount);
+
     this.osc.connect(this.filter).connect(this.panner).connect(this.gain).connect(out);
+    this.gain.connect(this.analyser);
     this.osc.start();
 
     const now = ctx.currentTime;
-    this.gain.gain.linearRampToValueAtTime(0.05 + brightness * 0.25, now + 0.015);
+    this.gain.gain.linearRampToValueAtTime((0.05 + brightness * 0.25) * volume, now + 0.015);
   }
 
-  update(frequency: number, pan: number, brightness: number): void {
+  // RMS amplitude of this voice's own envelope (0..~0.5) — used to drive a
+  // star's glow directly off the sound it's actually making, rather than a
+  // fixed-duration CSS flash guessing at the envelope shape.
+  getLevel(): number {
+    this.analyser.getByteTimeDomainData(this.levelBuffer);
+    let sumSquares = 0;
+    for (const sample of this.levelBuffer) {
+      const normalized = (sample - 128) / 128;
+      sumSquares += normalized * normalized;
+    }
+    return Math.sqrt(sumSquares / this.levelBuffer.length);
+  }
+
+  update(frequency: number, pan: number, brightness: number, clarity = 0, volume = 1): void {
     const now = this.ctx.currentTime;
     this.osc.frequency.setTargetAtTime(frequency, now, 0.03);
     this.panner.pan.setTargetAtTime(pan, now, 0.05);
-    this.filter.frequency.setTargetAtTime(400 + brightness * 4000, now, 0.05);
-    this.gain.gain.setTargetAtTime(0.05 + brightness * 0.25, now, 0.05);
+    this.filter.frequency.setTargetAtTime(350 + brightness * 1900 + clarity * 2500, now, 0.05);
+    this.gain.gain.setTargetAtTime((0.05 + brightness * 0.25) * volume, now, 0.05);
   }
 
   release(fadeMs = 200): void {
@@ -126,8 +172,8 @@ class Voice {
     this.osc.stop(now + fadeMs / 1000 + 0.05);
   }
 
-  pluck(durationMs = 350): void {
-    setTimeout(() => this.release(180), durationMs);
+  pluck(holdMs = 350, fadeMs = 180): void {
+    setTimeout(() => this.release(fadeMs), holdMs);
   }
 }
 
@@ -168,8 +214,36 @@ const edges: Edge[] = [];
 const starDrags = new Map<number, DragState>();
 const justDragged = new Set<HTMLButtonElement>();
 
+// --- Hover melody: whether a star is eligible to re-trigger via passive
+// hover. Any pluck (click, sequencer, keyboard, hover) disarms its star;
+// it only re-arms once the cursor actually leaves HOVER_RADIUS around it.
+const starHoverArmed = new Map<HTMLButtonElement, boolean>();
+
 let sequencerTimer: number | null = null;
 let sequencerStep = 0;
+
+// --- Glow: each star's brightness/flare follows the live amplitude of its
+// own voice (via Voice#getLevel), not a fixed-duration CSS guess. `glowGen`
+// lets a fresh pluck/drag cancel a still-running loop from the same star
+// without the two racing to write --amp.
+const glowGen = new Map<HTMLButtonElement, number>();
+
+function attachGlow(star: HTMLButtonElement, voice: Voice, stopAfterMs?: number): void {
+  const gen = (glowGen.get(star) ?? 0) + 1;
+  glowGen.set(star, gen);
+  const start = performance.now();
+
+  function frame(): void {
+    if (glowGen.get(star) !== gen) return;
+    star.style.setProperty("--amp", voice.getLevel().toFixed(3));
+    if (stopAfterMs !== undefined && performance.now() - start >= stopAfterMs) {
+      star.style.setProperty("--amp", "0");
+      return;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
 
 function positionStar(star: HTMLButtonElement, x: number, y: number): void {
   star.style.left = `${x}px`;
@@ -225,12 +299,24 @@ function flashEdge(a: HTMLButtonElement, b: HTMLButtonElement, ms = 250): void {
   }
 }
 
-function pluckStar(star: HTMLButtonElement, durationMs = 350): void {
+function pluckStar(star: HTMLButtonElement, holdMsOverride?: number, volume = 1): void {
   const { ctx, master: out } = ensureAudio();
   const state = starState.get(star)!;
-  const voice = new Voice(ctx, out, frequencyFor(state.y), panFor(state.x), brightnessFor(state.size));
-  voice.pluck(durationMs);
-  flashActive(star, durationMs);
+  const hold = holdMsOverride ?? durationFor(state.size);
+  const fade = fadeFor(state.size);
+  const voice = new Voice(
+    ctx,
+    out,
+    frequencyFor(state.y),
+    panFor(state.x),
+    brightnessFor(state.size),
+    clarityFor(state.y),
+    volume,
+  );
+  voice.pluck(hold, fade);
+  flashActive(star, hold);
+  attachGlow(star, voice, hold + fade + 50);
+  starHoverArmed.set(star, false);
 }
 
 function drawEdge(a: HTMLButtonElement, b: HTMLButtonElement): void {
@@ -304,14 +390,22 @@ function wireStar(star: HTMLButtonElement): void {
       drag.dragging = true;
       const { ctx, master: out } = ensureAudio();
       const state = starState.get(star)!;
-      drag.voice = new Voice(ctx, out, frequencyFor(state.y), panFor(state.x), brightnessFor(state.size));
+      drag.voice = new Voice(
+        ctx,
+        out,
+        frequencyFor(state.y),
+        panFor(state.x),
+        brightnessFor(state.size),
+        clarityFor(state.y),
+      );
+      attachGlow(star, drag.voice);
       dismissHint();
     }
     if (drag.dragging) {
       const { x, y } = toSkyCoords(e.clientX, e.clientY);
       moveStar(star, x, y);
       const state = starState.get(star)!;
-      drag.voice?.update(frequencyFor(state.y), panFor(state.x), brightnessFor(state.size));
+      drag.voice?.update(frequencyFor(state.y), panFor(state.x), brightnessFor(state.size), clarityFor(state.y));
     }
   });
 
@@ -320,6 +414,7 @@ function wireStar(star: HTMLButtonElement): void {
     if (!drag || drag.star !== star) return;
     if (drag.dragging) {
       drag.voice?.release();
+      if (drag.voice) attachGlow(star, drag.voice, 250);
       justDragged.add(star);
     }
     starDrags.delete(e.pointerId);
@@ -346,10 +441,15 @@ function createStar(index: number): void {
   const { x, y } = randomPosition(Array.from(starState.values()));
   starState.set(star, { x, y, size });
 
-  const diameter = 8 + size * 18;
+  const diameter = 4 + size * 9;
   star.style.width = `${diameter}px`;
   star.style.height = `${diameter}px`;
+  star.style.setProperty("--size", size.toFixed(2));
   positionStar(star, x, y);
+
+  const flickerDuration = 2.5 + Math.random() * 3.5;
+  star.style.animationDuration = `${flickerDuration}s`;
+  star.style.animationDelay = `${-Math.random() * flickerDuration}s`;
 
   sky.appendChild(star);
   wireStar(star);
@@ -385,17 +485,18 @@ sky.addEventListener("keydown", (e) => {
   e.preventDefault();
   const state = starState.get(target)!;
   moveStar(target, state.x + dx, state.y + dy);
-  pluckStar(target, 300);
+  pluckStar(target);
   dismissHint();
 });
 
-// --- Shooting stars: dragging on empty sky plucks a quick, ephemeral
+// --- Shooting stars: moving the mouse over empty sky (hover — no button
+// held, same trigger as the ambient melody below) plucks a quick, ephemeral
 // melody along the path and leaves a fading trail — nothing here joins the
 // permanent constellation.
-function pluckAt(x: number, y: number, durationMs = 220): void {
+function pluckAt(x: number, y: number, volume = 1): void {
   const { ctx, master: out } = ensureAudio();
-  const voice = new Voice(ctx, out, frequencyFor(y), panFor(x), brightnessFor(SHOOT_SIZE));
-  voice.pluck(durationMs);
+  const voice = new Voice(ctx, out, frequencyFor(y), panFor(x), brightnessFor(SHOOT_SIZE), clarityFor(y), volume);
+  voice.pluck(durationFor(SHOOT_SIZE), fadeFor(SHOOT_SIZE));
 }
 
 function drawTrailSegment(x1: number, y1: number, x2: number, y2: number): void {
@@ -409,38 +510,81 @@ function drawTrailSegment(x1: number, y1: number, x2: number, y2: number): void 
   line.addEventListener("animationend", () => line.remove());
 }
 
-interface ShootState {
-  lastX: number;
-  lastY: number;
-  lastTime: number;
-}
-
-let shootState: ShootState | null = null;
+let lastMeteorPoint: { x: number; y: number; time: number } | null = null;
 
 sky.addEventListener("pointerdown", (e) => {
   const target = e.target;
-  if (target instanceof Element && target.closest(".star")) return;
-  sky.setPointerCapture(e.pointerId);
-  const { x, y } = toSkyCoords(e.clientX, e.clientY);
-  shootState = { lastX: x, lastY: y, lastTime: performance.now() };
-  dismissHint();
+  if (!(target instanceof Element && target.closest(".star"))) dismissHint();
 });
 
 sky.addEventListener("pointermove", (e) => {
-  if (!shootState) return;
-  const { x, y } = toSkyCoords(e.clientX, e.clientY);
-  const dist = Math.hypot(x - shootState.lastX, y - shootState.lastY);
-  const dt = performance.now() - shootState.lastTime;
-  if (dist < SHOOT_MIN_DIST && dt < SHOOT_MIN_MS) return;
-  drawTrailSegment(shootState.lastX, shootState.lastY, x, y);
-  pluckAt(x, y);
-  shootState = { lastX: x, lastY: y, lastTime: performance.now() };
+  if (e.buttons === 0) {
+    handleHoverMelody(e);
+    return;
+  }
+  lastMeteorPoint = null; // dragging a star resets meteor-trail continuity
 });
 
-function endShoot(): void {
-  shootState = null;
+// --- Hover melody: moving the mouse over the sky with no button held plays
+// a quiet drone that glides with the cursor, plus a distinct "ting" for
+// each star the cursor sweeps past, plus the shooting-star trail+pluck above
+// — brushing past the constellation without committing any of it to the
+// permanent chain. The drone/ting sound requires audio to already be
+// unlocked by a prior click/tap/key (browsers won't start an AudioContext
+// from a bare mousemove); the trail is purely visual, so it can appear
+// before that first gesture. Everything here plays quieter than an actual
+// click — connecting stars is the main instrument, hover is background
+// texture underneath it, not competing with it.
+const HOVER_RADIUS = 50;
+const HOVER_IDLE_MS = 500;
+const HOVER_VOLUME = 0.35;
+let hoverVoice: Voice | null = null;
+let hoverIdleTimer: number | null = null;
+
+function handleHoverMelody(e: PointerEvent): void {
+  const { x, y } = toSkyCoords(e.clientX, e.clientY);
+
+  if (lastMeteorPoint) {
+    const dist = Math.hypot(x - lastMeteorPoint.x, y - lastMeteorPoint.y);
+    const dt = performance.now() - lastMeteorPoint.time;
+    if (dist >= SHOOT_MIN_DIST || dt >= SHOOT_MIN_MS) {
+      drawTrailSegment(lastMeteorPoint.x, lastMeteorPoint.y, x, y);
+      dismissHint();
+      if (audioCtx) pluckAt(x, y, HOVER_VOLUME);
+      lastMeteorPoint = { x, y, time: performance.now() };
+    }
+  } else {
+    lastMeteorPoint = { x, y, time: performance.now() };
+  }
+
+  if (!audioCtx) return;
+  const { ctx, master: out } = ensureAudio();
+
+  if (!hoverVoice) hoverVoice = new Voice(ctx, out, frequencyFor(y), panFor(x), 0, clarityFor(y), HOVER_VOLUME);
+  else hoverVoice.update(frequencyFor(y), panFor(x), 0, clarityFor(y), HOVER_VOLUME);
+
+  if (hoverIdleTimer !== null) clearTimeout(hoverIdleTimer);
+  hoverIdleTimer = window.setTimeout(() => {
+    hoverVoice?.release(400);
+    hoverVoice = null;
+    hoverIdleTimer = null;
+  }, HOVER_IDLE_MS);
+
+  for (const [star, state] of starState) {
+    const near = Math.hypot(state.x - x, state.y - y) <= HOVER_RADIUS;
+    if (near && (starHoverArmed.get(star) ?? true)) {
+      pluckStar(star, undefined, HOVER_VOLUME);
+    }
+    if (!near) starHoverArmed.set(star, true);
+  }
 }
-sky.addEventListener("pointerup", endShoot);
-sky.addEventListener("pointercancel", endShoot);
+
+sky.addEventListener("pointerleave", () => {
+  lastMeteorPoint = null;
+  if (hoverIdleTimer !== null) clearTimeout(hoverIdleTimer);
+  hoverIdleTimer = null;
+  hoverVoice?.release(250);
+  hoverVoice = null;
+});
 
 clearButton.addEventListener("click", () => clearConstellation());

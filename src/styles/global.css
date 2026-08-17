@@ -23,6 +23,7 @@ main {
   user-select: none;
 }
 
+
 #lines {
   position: absolute;
   inset: 0;
@@ -32,18 +33,43 @@ main {
 }
 
 .edge {
-  stroke: #7fa8ff;
-  stroke-width: 1.5;
+  fill: none;
+  stroke: #9fc2ff;
+  stroke-width: 2;
   stroke-linecap: round;
-  opacity: 0.5;
-  filter: drop-shadow(0 0 3px #7fa8ff);
+  stroke-dasharray: 0 11;
+  opacity: 0.6;
+  filter: drop-shadow(0 0 2px #7fa8ff);
   transition: opacity 150ms ease;
+  animation:
+    edge-drift 3.5s linear infinite,
+    edge-shimmer 1.6s ease-in-out infinite;
 }
 
 .edge.edge-active {
-  stroke: #d8e8ff;
+  stroke: #fff6dc;
+  stroke-width: 2.5;
+  stroke-dasharray: 0 7;
   opacity: 1;
-  filter: drop-shadow(0 0 6px #d8e8ff);
+  filter: drop-shadow(0 0 5px #ffe9a8);
+  animation: edge-drift 1.2s linear infinite;
+}
+
+@keyframes edge-drift {
+  to {
+    stroke-dashoffset: -22;
+  }
+}
+
+@keyframes edge-shimmer {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 0.85;
+  }
 }
 
 .trail {
@@ -65,44 +91,70 @@ main {
 }
 
 .star {
-  --star-shape: polygon(
-    50% 0%,
-    61% 35%,
-    98% 35%,
-    68% 57%,
-    79% 91%,
-    50% 70%,
-    21% 91%,
-    32% 57%,
-    2% 35%,
-    39% 35%
-  );
+  --size: 0.6;
+  --amp: 0;
 
   position: absolute;
   transform: translate(-50%, -50%);
-  clip-path: var(--star-shape);
   border: none;
   padding: 0;
-  background: #eef4ff;
-  filter: drop-shadow(0 0 5px #bcd4ff);
+  border-radius: 50%;
+  background: transparent;
   cursor: pointer;
-  animation: twinkle 3s ease-in-out infinite;
+  animation: flicker 4s ease-in-out infinite;
+}
+
+.star::before,
+.star::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+
+.star::before {
+  inset: -140%;
+  background: repeating-conic-gradient(
+    from 0deg,
+    rgb(255 224 158 / 85%) 0deg 0.6deg,
+    transparent 0.6deg 90deg
+  );
+  mask-image: radial-gradient(circle, #000 0%, transparent 60%);
+  transform: scale(calc(1 + var(--amp) * (0.5 + var(--size) * 0.9)));
+  transition: transform 60ms linear;
+}
+
+.star::after {
+  inset: -35%;
+  border-radius: 50%;
+  background: radial-gradient(circle, #fffef2 0%, #ffd873 40%, rgb(255 184 82 / 0%) 75%);
+  transform: scale(calc(1 + var(--amp) * (0.4 + var(--size) * 0.7)));
+  filter: brightness(calc(1 + var(--amp) * 1.8));
+  transition:
+    transform 60ms linear,
+    filter 60ms linear;
 }
 
 .star:focus-visible {
-  outline: 2px solid #f5f5f5;
-  outline-offset: 3px;
+  outline: 2px solid #fff6d8;
+  outline-offset: 4px;
 }
 
-.star.active {
-  background: #fffaf0;
-  filter: drop-shadow(0 0 10px #ffe9a8);
+.star.active::before {
+  background: repeating-conic-gradient(
+    from 0deg,
+    rgb(255 246 216 / 95%) 0deg 0.8deg,
+    transparent 0.8deg 90deg
+  );
 }
 
-@keyframes twinkle {
+.star.active::after {
+  background: radial-gradient(circle, #fff 0%, #fff2c9 40%, rgb(255 233 168 / 0%) 78%);
+}
+
+@keyframes flicker {
   0%,
   100% {
-    opacity: 0.75;
+    opacity: 0.35;
   }
 
   50% {

@@ -467,6 +467,7 @@ function connectStar(star: HTMLButtonElement): void {
 
 function clearConstellation(): void {
   stopSequencer();
+  for (const star of chainOrder) star.classList.remove("is-lit");
   chainOrder.length = 0;
   for (const edge of edges) edge.line.remove();
   edges.length = 0;

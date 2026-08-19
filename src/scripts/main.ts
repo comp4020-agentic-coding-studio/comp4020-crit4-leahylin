@@ -109,12 +109,13 @@ class Voice {
 
   constructor(
     private ctx: AudioContext,
-    out: AudioNode,
+    private out: AudioNode,
     frequency: number,
     pan: number,
-    brightness: number,
+    private brightness: number,
     clarity = 0,
-    volume = 1,
+    private volume = 1,
+    attackMs = 15,
   ) {
     this.osc = ctx.createOscillator();
     this.osc.type = "triangle";
@@ -140,7 +141,7 @@ class Voice {
     this.osc.start();
 
     const now = ctx.currentTime;
-    this.gain.gain.linearRampToValueAtTime((0.05 + brightness * 0.25) * volume, now + 0.015);
+    this.gain.gain.linearRampToValueAtTime((0.05 + brightness * 0.25) * volume, now + attackMs / 1000);
   }
 
   // RMS amplitude of this voice's own envelope (0..~0.5) — used to drive a
@@ -172,8 +173,39 @@ class Voice {
     this.osc.stop(now + fadeMs / 1000 + 0.05);
   }
 
-  pluck(holdMs = 350, fadeMs = 180): void {
+  pluck(holdMs = 350, fadeMs = 180, sparkle = false): void {
+    if (sparkle) this.playSparkle();
     setTimeout(() => this.release(fadeMs), holdMs);
+  }
+
+  // A brief, quiet, consonant overtone (octave + octave-fifth) layered under
+  // a note's attack for a glassy "crystal chime" edge — routed straight to
+  // the master bus rather than through this voice's own filter/gain/panner,
+  // so its short, fixed decay never gets stretched or truncated by that
+  // note's own holdMs/fadeMs (which vary with star size).
+  private playSparkle(): void {
+    const now = this.ctx.currentTime;
+    const fundamental = this.osc.frequency.value;
+    const pan = this.panner.pan.value;
+    const scale = (0.4 + this.brightness * 0.6) * this.volume;
+    const partials: Array<[ratio: number, peak: number]> = [
+      [2, 0.05 * scale],
+      [3, 0.035 * scale],
+    ];
+    for (const [ratio, peak] of partials) {
+      const osc = this.ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.value = fundamental * ratio;
+      const gain = this.ctx.createGain();
+      gain.gain.value = 0;
+      const panner = this.ctx.createStereoPanner();
+      panner.pan.value = pan;
+      osc.connect(gain).connect(panner).connect(this.out);
+      osc.start(now);
+      gain.gain.linearRampToValueAtTime(peak, now + 0.008);
+      gain.gain.setTargetAtTime(0, now + 0.008, 0.05);
+      osc.stop(now + 0.26);
+    }
   }
 }
 
@@ -207,6 +239,19 @@ const STEP_MS = 450;
 const SHOOT_MIN_DIST = 40;
 const SHOOT_MIN_MS = 90;
 const SHOOT_SIZE = 0.6;
+
+// --- "Drawing music": a soft ambient swell on first touch, a crystalline
+// chime when a connection lands, and a warm consonant chord each time the
+// constellation's melody completes a full loop.
+const SWELL_ATTACK_MS = 500;
+const SWELL_HOLD_MS = 550; // >= attack, so the swell actually blooms before fading
+const SWELL_FADE_MS = 450;
+const SWELL_VOLUME = 0.12;
+const CHORD_VOLUME = 0.18;
+const CHORD_ATTACK_MS = 500;
+const CHORD_HOLD_MS = 550; // >= attack, same reasoning as the swell
+const CHORD_FADE_MS = 900;
+const CHORD_PAN_SPREAD = 0.25;
 
 const starState = new Map<HTMLButtonElement, StarState>();
 const chainOrder: HTMLButtonElement[] = [];
@@ -299,7 +344,7 @@ function flashEdge(a: HTMLButtonElement, b: HTMLButtonElement, ms = 250): void {
   }
 }
 
-function pluckStar(star: HTMLButtonElement, holdMsOverride?: number, volume = 1): void {
+function pluckStar(star: HTMLButtonElement, holdMsOverride?: number, volume = 1, sparkle = false): void {
   const { ctx, master: out } = ensureAudio();
   const state = starState.get(star)!;
   const hold = holdMsOverride ?? durationFor(state.size);
@@ -313,10 +358,30 @@ function pluckStar(star: HTMLButtonElement, holdMsOverride?: number, volume = 1)
     clarityFor(state.y),
     volume,
   );
-  voice.pluck(hold, fade);
+  voice.pluck(hold, fade, sparkle);
   flashActive(star, hold);
   attachGlow(star, voice, hold + fade + 50);
   starHoverArmed.set(star, false);
+}
+
+// A very subtle, slow-attack rising tone played the instant a pointer
+// touches any star — before it's known whether the gesture will become a
+// click-to-connect or a drag-to-reposition. Self-contained: its own Voice,
+// its own release, no interaction state touched.
+function playPointerSwell(star: HTMLButtonElement): void {
+  const { ctx, master: out } = ensureAudio();
+  const state = starState.get(star)!;
+  const voice = new Voice(
+    ctx,
+    out,
+    frequencyFor(state.y),
+    panFor(state.x),
+    brightnessFor(state.size),
+    clarityFor(state.y),
+    SWELL_VOLUME,
+    SWELL_ATTACK_MS,
+  );
+  voice.pluck(SWELL_HOLD_MS, SWELL_FADE_MS);
 }
 
 function drawEdge(a: HTMLButtonElement, b: HTMLButtonElement): void {
@@ -339,13 +404,42 @@ function stopSequencer(): void {
   }
 }
 
+// A soft root/fifth/octave chord off the chain's first star — played only
+// when the melody loop actually wraps back around to its start, so the
+// constellation feels like it "comes alive" once a phrase completes rather
+// than glittering on every single note.
+function playLoopChord(rootStar: HTMLButtonElement): void {
+  const { ctx, master: out } = ensureAudio();
+  const state = starState.get(rootStar)!;
+  const rootFreq = frequencyFor(state.y);
+  const brightness = brightnessFor(state.size);
+  const clarity = clarityFor(state.y);
+  const pan = panFor(state.x);
+  const ratios = [1, 1.5, 2]; // root, fifth, octave — consonant only
+  ratios.forEach((ratio, i) => {
+    const voice = new Voice(
+      ctx,
+      out,
+      rootFreq * ratio,
+      clamp(pan + (i - 1) * CHORD_PAN_SPREAD, -1, 1),
+      brightness,
+      clarity,
+      CHORD_VOLUME,
+      CHORD_ATTACK_MS,
+    );
+    voice.pluck(CHORD_HOLD_MS, CHORD_FADE_MS);
+  });
+}
+
 function scheduleSequencerStep(): void {
   if (chainOrder.length < 2) return;
+  const isLoopWrap = sequencerStep > 0 && sequencerStep % chainOrder.length === 0;
   const star = chainOrder[sequencerStep % chainOrder.length]!;
   const prevIndex = (sequencerStep - 1 + chainOrder.length) % chainOrder.length;
   const prevStar = chainOrder[prevIndex]!;
   pluckStar(star, Math.round(STEP_MS * 0.8));
   flashEdge(prevStar, star, Math.round(STEP_MS * 0.8));
+  if (isLoopWrap) playLoopChord(chainOrder[0]!);
   sequencerStep++;
   sequencerTimer = window.setTimeout(scheduleSequencerStep, STEP_MS);
 }
@@ -361,9 +455,12 @@ function restartSequencer(): void {
 function connectStar(star: HTMLButtonElement): void {
   const last = chainOrder[chainOrder.length - 1];
   if (last === star) return;
+  star.classList.add("is-lit");
+  star.classList.add("igniting");
+  setTimeout(() => star.classList.remove("igniting"), 550); // matches ignite-burst's duration
   chainOrder.push(star);
   if (last) drawEdge(last, star);
-  pluckStar(star);
+  pluckStar(star, undefined, 1, true);
   restartSequencer();
   dismissHint();
 }
@@ -379,6 +476,7 @@ function wireStar(star: HTMLButtonElement): void {
   star.addEventListener("pointerdown", (e) => {
     star.setPointerCapture(e.pointerId);
     starDrags.set(e.pointerId, { star, dragging: false, startX: e.clientX, startY: e.clientY, voice: null });
+    playPointerSwell(star);
   });
 
   star.addEventListener("pointermove", (e) => {
@@ -447,7 +545,7 @@ function createStar(index: number): void {
   star.style.setProperty("--size", size.toFixed(2));
   positionStar(star, x, y);
 
-  const flickerDuration = 2.5 + Math.random() * 3.5;
+  const flickerDuration = 4 + Math.random() * 5;
   star.style.animationDuration = `${flickerDuration}s`;
   star.style.animationDelay = `${-Math.random() * flickerDuration}s`;
 

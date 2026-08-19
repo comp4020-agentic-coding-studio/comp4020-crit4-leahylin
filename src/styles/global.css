@@ -101,7 +101,50 @@ main {
   border-radius: 50%;
   background: transparent;
   cursor: pointer;
+  animation: dim-flicker 6s ease-in-out infinite;
+  filter: brightness(0.62) drop-shadow(0 0 3px rgb(255 214 150 / 30%));
+  transition: filter 300ms ease-out;
+}
+
+.star:hover {
+  filter: brightness(0.85) drop-shadow(0 0 5px rgb(255 214 150 / 45%));
+}
+
+/* A star stays this dim, atmospheric sliver until the user actually clicks
+   or taps it — the constellation reveals itself one activation at a time. */
+.star.is-lit {
   animation: flicker 4s ease-in-out infinite;
+  filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+}
+
+.star.is-lit:hover {
+  filter: brightness(1.8) drop-shadow(0 0 15px rgb(255 214 150 / 85%));
+}
+
+/* One-shot radiating pulse the moment a star joins the chain, timed to match
+   its ignite-burst animation duration below — after it plays out, the star
+   settles into .is-lit's static filter, which matches the keyframe's 100%. */
+.star.is-lit.igniting {
+  animation: ignite-burst 550ms ease-out forwards;
+}
+
+@keyframes ignite-burst {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+    box-shadow: 0 0 0 0 rgb(255 224 170 / 55%);
+  }
+
+  30% {
+    transform: translate(-50%, -50%) scale(1.55);
+    filter: brightness(2.6) drop-shadow(0 0 28px rgb(255 224 170 / 95%));
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+    box-shadow: 0 0 0 26px rgb(255 224 170 / 0%);
+  }
 }
 
 .star::before,
@@ -154,11 +197,22 @@ main {
 @keyframes flicker {
   0%,
   100% {
-    opacity: 0.35;
+    opacity: 0.6;
   }
 
   50% {
     opacity: 1;
+  }
+}
+
+@keyframes dim-flicker {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 0.55;
   }
 }
 

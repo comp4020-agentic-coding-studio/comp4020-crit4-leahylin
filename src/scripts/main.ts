@@ -82,6 +82,33 @@ function ensureAudio(): { ctx: AudioContext; master: GainNode } {
     master = audioCtx.createGain();
     master.gain.value = 0.8;
     master.connect(compressor);
+
+    // A shared, subtle sense of space: every voice already routes through
+    // `master`, so one feedback-delay bus gives all of them (pluck, chime,
+    // chord, hover, whoosh) a soft shared tail. The feedback gain (0.32) is a
+    // hard sub-unity scalar with no unity/>1 path in the loop, so each repeat
+    // is strictly quieter than the last (a convergent geometric series) —
+    // this cannot self-sustain or build up no matter how long it runs.
+    const spaceSend = audioCtx.createGain();
+    spaceSend.gain.value = 0.5;
+    const spaceDelay = audioCtx.createDelay(1);
+    spaceDelay.delayTime.value = 0.28;
+    const spaceFilter = audioCtx.createBiquadFilter();
+    spaceFilter.type = "lowpass";
+    spaceFilter.frequency.value = 2200;
+    spaceFilter.Q.value = 0.5;
+    const spaceFeedback = audioCtx.createGain();
+    spaceFeedback.gain.value = 0.32;
+    const spaceWet = audioCtx.createGain();
+    spaceWet.gain.value = 0.22;
+
+    master.connect(spaceSend);
+    spaceSend.connect(spaceDelay);
+    spaceDelay.connect(spaceFilter);
+    spaceFilter.connect(spaceFeedback);
+    spaceFeedback.connect(spaceDelay);
+    spaceFilter.connect(spaceWet);
+    spaceWet.connect(compressor);
   }
   if (audioCtx.state === "suspended") void audioCtx.resume();
   return { ctx: audioCtx, master };
@@ -99,13 +126,25 @@ window.addEventListener("keydown", () => ensureAudio(), { once: true });
 // gain envelope -> the shared master bus. `pluck` is for taps/keys/shooting
 // stars (self-releasing); `update`/`release` are for the held preview tone
 // while dragging a star.
-class Voice {
+// A minimal structural interface so anything that exposes an RMS level
+// (Voice, NoiseWhoosh) can drive a star's glow via attachGlow.
+interface LevelSource {
+  getLevel(): number;
+}
+
+class Voice implements LevelSource {
   private osc: OscillatorNode;
   private filter: BiquadFilterNode;
   private panner: StereoPannerNode;
   private gain: GainNode;
   private analyser: AnalyserNode;
   private levelBuffer: Uint8Array<ArrayBuffer>;
+  // A quiet extra sine layer whose ratio/prominence depends on brightness —
+  // a sub-octave for large/bright stars (richer, deeper), an octave up for
+  // small/dim ones (delicate, glassy) — so star size colors the timbre
+  // itself, not just volume/duration. Silent (peak 0) for medium stars.
+  private charOsc: OscillatorNode;
+  private charGain: GainNode;
 
   constructor(
     private ctx: AudioContext,
@@ -124,7 +163,9 @@ class Voice {
     this.filter = ctx.createBiquadFilter();
     this.filter.type = "lowpass";
     this.filter.frequency.value = 350 + brightness * 1900 + clarity * 2500;
-    this.filter.Q.value = 0.7;
+    // Small/dim stars ring more (higher Q, glassier); large/bright stars stay
+    // smoother and warmer.
+    this.filter.Q.value = 1.8 - brightness * 1.2;
 
     this.panner = ctx.createStereoPanner();
     this.panner.pan.value = pan;
@@ -140,8 +181,19 @@ class Voice {
     this.gain.connect(this.analyser);
     this.osc.start();
 
+    const charRatio = brightness > 0.5 ? 0.5 : 2;
+    const charPeak = Math.abs(brightness - 0.5) * 2 * 0.05 * volume;
+    this.charOsc = ctx.createOscillator();
+    this.charOsc.type = "sine";
+    this.charOsc.frequency.value = frequency * charRatio;
+    this.charGain = ctx.createGain();
+    this.charGain.gain.value = 0;
+    this.charOsc.connect(this.charGain).connect(this.panner);
+    this.charOsc.start();
+
     const now = ctx.currentTime;
     this.gain.gain.linearRampToValueAtTime((0.05 + brightness * 0.25) * volume, now + attackMs / 1000);
+    this.charGain.gain.linearRampToValueAtTime(charPeak, now + attackMs / 1000);
   }
 
   // RMS amplitude of this voice's own envelope (0..~0.5) — used to drive a
@@ -157,9 +209,9 @@ class Voice {
     return Math.sqrt(sumSquares / this.levelBuffer.length);
   }
 
-  update(frequency: number, pan: number, brightness: number, clarity = 0, volume = 1): void {
+  update(frequency: number, pan: number, brightness: number, clarity = 0, volume = 1, glideTimeConstant = 0.03): void {
     const now = this.ctx.currentTime;
-    this.osc.frequency.setTargetAtTime(frequency, now, 0.03);
+    this.osc.frequency.setTargetAtTime(frequency, now, glideTimeConstant);
     this.panner.pan.setTargetAtTime(pan, now, 0.05);
     this.filter.frequency.setTargetAtTime(350 + brightness * 1900 + clarity * 2500, now, 0.05);
     this.gain.gain.setTargetAtTime((0.05 + brightness * 0.25) * volume, now, 0.05);
@@ -171,6 +223,10 @@ class Voice {
     this.gain.gain.setValueAtTime(this.gain.gain.value, now);
     this.gain.gain.linearRampToValueAtTime(0, now + fadeMs / 1000);
     this.osc.stop(now + fadeMs / 1000 + 0.05);
+    this.charGain.gain.cancelScheduledValues(now);
+    this.charGain.gain.setValueAtTime(this.charGain.gain.value, now);
+    this.charGain.gain.linearRampToValueAtTime(0, now + fadeMs / 1000);
+    this.charOsc.stop(now + fadeMs / 1000 + 0.05);
   }
 
   pluck(holdMs = 350, fadeMs = 180, sparkle = false): void {
@@ -184,28 +240,117 @@ class Voice {
   // so its short, fixed decay never gets stretched or truncated by that
   // note's own holdMs/fadeMs (which vary with star size).
   private playSparkle(): void {
-    const now = this.ctx.currentTime;
-    const fundamental = this.osc.frequency.value;
-    const pan = this.panner.pan.value;
     const scale = (0.4 + this.brightness * 0.6) * this.volume;
-    const partials: Array<[ratio: number, peak: number]> = [
-      [2, 0.05 * scale],
-      [3, 0.035 * scale],
-    ];
-    for (const [ratio, peak] of partials) {
-      const osc = this.ctx.createOscillator();
-      osc.type = "sine";
-      osc.frequency.value = fundamental * ratio;
-      const gain = this.ctx.createGain();
-      gain.gain.value = 0;
-      const panner = this.ctx.createStereoPanner();
-      panner.pan.value = pan;
-      osc.connect(gain).connect(panner).connect(this.out);
-      osc.start(now);
-      gain.gain.linearRampToValueAtTime(peak, now + 0.008);
-      gain.gain.setTargetAtTime(0, now + 0.008, 0.05);
-      osc.stop(now + 0.26);
+    playChimeShimmer(this.ctx, this.out, this.osc.frequency.value, this.panner.pan.value, scale);
+  }
+}
+
+// Shared crystalline-shimmer synthesis: two quiet consonant overtones (octave
+// + octave-fifth), routed straight to `out` with their own short fixed decay
+// — used by Voice.playSparkle (a note's connect-chime edge) and by shooting
+// stars (their own distinct sound identity, see pluckAt).
+function playChimeShimmer(ctx: AudioContext, out: AudioNode, fundamental: number, pan: number, scale: number): void {
+  const now = ctx.currentTime;
+  const partials: Array<[ratio: number, peak: number]> = [
+    [2, 0.05 * scale],
+    [3, 0.035 * scale],
+  ];
+  for (const [ratio, peak] of partials) {
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = fundamental * ratio;
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = pan;
+    osc.connect(gain).connect(panner).connect(out);
+    osc.start(now);
+    gain.gain.linearRampToValueAtTime(peak, now + 0.008);
+    gain.gain.setTargetAtTime(0, now + 0.008, 0.05);
+    osc.stop(now + 0.26);
+  }
+}
+
+interface NoiseWhooshOptions {
+  startFreq: number;
+  endFreq: number;
+  durationMs: number;
+  peakGain: number;
+  pan: number;
+  filterType?: BiquadFilterType;
+  Q?: number;
+}
+
+let noiseBuffer: AudioBuffer | null = null;
+
+function getNoiseBuffer(ctx: AudioContext): AudioBuffer {
+  if (!noiseBuffer) {
+    noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  }
+  return noiseBuffer;
+}
+
+// A brief, filtered noise sweep — an airy "whoosh" distinct from any
+// oscillator-based Voice. Used for a star's first-activation shimmer and for
+// shooting stars' own sound identity. Self-cleaning: its source's stop time
+// is scheduled synchronously at construction, same discipline as
+// Voice.release, so it can never be left running.
+class NoiseWhoosh implements LevelSource {
+  private source: AudioBufferSourceNode;
+  private filter: BiquadFilterNode;
+  private gain: GainNode;
+  private panner: StereoPannerNode;
+  private analyser: AnalyserNode;
+  private levelBuffer: Uint8Array<ArrayBuffer>;
+
+  constructor(ctx: AudioContext, out: AudioNode, opts: NoiseWhooshOptions) {
+    const now = ctx.currentTime;
+    this.source = ctx.createBufferSource();
+    this.source.buffer = getNoiseBuffer(ctx);
+    this.source.loop = true;
+
+    this.filter = ctx.createBiquadFilter();
+    this.filter.type = opts.filterType ?? "bandpass";
+    this.filter.Q.value = opts.Q ?? 1;
+    this.filter.frequency.setValueAtTime(opts.startFreq, now);
+    this.filter.frequency.linearRampToValueAtTime(opts.endFreq, now + opts.durationMs / 1000);
+
+    this.gain = ctx.createGain();
+    this.gain.gain.value = 0;
+
+    this.panner = ctx.createStereoPanner();
+    this.panner.pan.value = opts.pan;
+
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = 32;
+    this.levelBuffer = new Uint8Array(this.analyser.frequencyBinCount);
+
+    this.source.connect(this.filter).connect(this.gain).connect(this.panner).connect(out);
+    this.gain.connect(this.analyser);
+
+    this.gain.gain.linearRampToValueAtTime(opts.peakGain, now + (opts.durationMs * 0.3) / 1000);
+    this.gain.gain.linearRampToValueAtTime(0, now + opts.durationMs / 1000);
+    this.source.start(now);
+    this.source.stop(now + opts.durationMs / 1000 + 0.05);
+    this.source.onended = () => {
+      this.source.disconnect();
+      this.filter.disconnect();
+      this.gain.disconnect();
+      this.panner.disconnect();
+      this.analyser.disconnect();
+    };
+  }
+
+  getLevel(): number {
+    this.analyser.getByteTimeDomainData(this.levelBuffer);
+    let sumSquares = 0;
+    for (const sample of this.levelBuffer) {
+      const normalized = (sample - 128) / 128;
+      sumSquares += normalized * normalized;
     }
+    return Math.sqrt(sumSquares / this.levelBuffer.length);
   }
 }
 
@@ -231,6 +376,10 @@ interface DragState {
   voice: Voice | null;
 }
 
+// Purely cosmetic per-star variance (shape, rotation, ray length, glow
+// radius) — assigned once at creation, alongside the audio-driving --size.
+const STAR_SHAPES = ["point", "particle", "burst", "cross"] as const;
+
 const STAR_COUNT = 20;
 const MARGIN = 40;
 const MIN_SPACING = 70;
@@ -238,7 +387,6 @@ const DRAG_THRESHOLD = 6;
 const STEP_MS = 450;
 const SHOOT_MIN_DIST = 40;
 const SHOOT_MIN_MS = 90;
-const SHOOT_SIZE = 0.6;
 
 // --- "Drawing music": a soft ambient swell on first touch, a crystalline
 // chime when a connection lands, and a warm consonant chord each time the
@@ -273,7 +421,7 @@ let sequencerStep = 0;
 // without the two racing to write --amp.
 const glowGen = new Map<HTMLButtonElement, number>();
 
-function attachGlow(star: HTMLButtonElement, voice: Voice, stopAfterMs?: number): void {
+function attachGlow(star: HTMLButtonElement, voice: LevelSource, stopAfterMs?: number): void {
   const gen = (glowGen.get(star) ?? 0) + 1;
   glowGen.set(star, gen);
   const start = performance.now();
@@ -382,6 +530,32 @@ function playPointerSwell(star: HTMLButtonElement): void {
     SWELL_ATTACK_MS,
   );
   voice.pluck(SWELL_HOLD_MS, SWELL_FADE_MS);
+  attachGlow(star, voice, SWELL_HOLD_MS + SWELL_FADE_MS + 50);
+}
+
+// The soft "awakening" whoosh/shimmer that opens a star's first activation —
+// a brief noise sweep toward its own pitch, glow-synced, followed shortly by
+// the existing connect chime (see connectStar) for a gentle-attack /
+// bright-peak / smooth-decay envelope overall.
+const AWAKEN_WHOOSH_MS = 220;
+const AWAKEN_CHIME_DELAY_MS = 80;
+const CONNECT_HANDOFF_FADE_MS = 120;
+
+function playAwakening(star: HTMLButtonElement): void {
+  const { ctx, master: out } = ensureAudio();
+  const state = starState.get(star)!;
+  const freq = frequencyFor(state.y);
+  const brightness = brightnessFor(state.size);
+  const whoosh = new NoiseWhoosh(ctx, out, {
+    startFreq: 500,
+    endFreq: clamp(freq * 1.5, 900, 3200),
+    durationMs: AWAKEN_WHOOSH_MS,
+    peakGain: 0.04 + brightness * 0.02,
+    pan: panFor(state.x),
+    filterType: "bandpass",
+    Q: 1.2,
+  });
+  attachGlow(star, whoosh, AWAKEN_WHOOSH_MS + 50);
 }
 
 function drawEdge(a: HTMLButtonElement, b: HTMLButtonElement): void {
@@ -429,6 +603,22 @@ function playLoopChord(rootStar: HTMLButtonElement): void {
     );
     voice.pluck(CHORD_HOLD_MS, CHORD_FADE_MS);
   });
+
+  // A faint, slow-blooming shimmer two octaves up, lingering after the chord
+  // itself has faded — grows gently with how much of the sky is chained,
+  // capped so it can never outgrow the chord it's decorating.
+  const richness = clamp(chainOrder.length / 8, 0, 1);
+  const shimmer = new Voice(
+    ctx,
+    out,
+    rootFreq * 4,
+    pan,
+    brightness,
+    clarity,
+    CHORD_VOLUME * 0.4 * richness,
+    900,
+  );
+  shimmer.pluck(CHORD_HOLD_MS, 1600);
 }
 
 function scheduleSequencerStep(): void {
@@ -455,12 +645,26 @@ function restartSequencer(): void {
 function connectStar(star: HTMLButtonElement): void {
   const last = chainOrder[chainOrder.length - 1];
   if (last === star) return;
+  const isFirstActivation = !star.classList.contains("is-lit");
+  if (hoverIdleTimer !== null) {
+    clearTimeout(hoverIdleTimer);
+    hoverIdleTimer = null;
+  }
+  if (hoverVoice) {
+    hoverVoice.release(CONNECT_HANDOFF_FADE_MS);
+    hoverVoice = null;
+  }
   star.classList.add("is-lit");
   star.classList.add("igniting");
   setTimeout(() => star.classList.remove("igniting"), 550); // matches ignite-burst's duration
   chainOrder.push(star);
   if (last) drawEdge(last, star);
-  pluckStar(star, undefined, 1, true);
+  if (isFirstActivation) {
+    playAwakening(star);
+    setTimeout(() => pluckStar(star, undefined, 1, true), AWAKEN_CHIME_DELAY_MS);
+  } else {
+    pluckStar(star, undefined, 1, true);
+  }
   restartSequencer();
   dismissHint();
 }
@@ -546,6 +750,15 @@ function createStar(index: number): void {
   star.style.setProperty("--size", size.toFixed(2));
   positionStar(star, x, y);
 
+  const shape = STAR_SHAPES[Math.floor(Math.random() * STAR_SHAPES.length)]!;
+  star.classList.add(`star-${shape}`);
+  star.style.setProperty("--rot", `${(Math.random() * 360).toFixed(1)}deg`);
+  star.style.setProperty("--ray-scale", (0.75 + Math.random() * 0.55).toFixed(2));
+  star.style.setProperty("--glow", (0.75 + Math.random() * 0.55).toFixed(2));
+  if (shape === "burst") {
+    star.style.setProperty("--ray-gap", Math.random() < 0.5 ? "90deg" : "60deg");
+  }
+
   const flickerDuration = 4 + Math.random() * 5;
   star.style.animationDuration = `${flickerDuration}s`;
   star.style.animationDelay = `${-Math.random() * flickerDuration}s`;
@@ -592,10 +805,22 @@ sky.addEventListener("keydown", (e) => {
 // held, same trigger as the ambient melody below) plucks a quick, ephemeral
 // melody along the path and leaves a fading trail — nothing here joins the
 // permanent constellation.
+const METEOR_WHOOSH_MS = 140;
+
 function pluckAt(x: number, y: number, volume = 1): void {
   const { ctx, master: out } = ensureAudio();
-  const voice = new Voice(ctx, out, frequencyFor(y), panFor(x), brightnessFor(SHOOT_SIZE), clarityFor(y), volume);
-  voice.pluck(durationFor(SHOOT_SIZE), fadeFor(SHOOT_SIZE));
+  const freq = frequencyFor(y);
+  const pan = panFor(x);
+  new NoiseWhoosh(ctx, out, {
+    startFreq: freq * 3,
+    endFreq: freq * 1.1,
+    durationMs: METEOR_WHOOSH_MS,
+    peakGain: 0.05 * volume,
+    pan,
+    filterType: "bandpass",
+    Q: 1.5,
+  });
+  playChimeShimmer(ctx, out, freq * 2, pan, 0.5 * volume);
 }
 
 function drawTrailSegment(x1: number, y1: number, x2: number, y2: number): void {
@@ -658,8 +883,18 @@ function handleHoverMelody(e: PointerEvent): void {
   if (!audioCtx) return;
   const { ctx, master: out } = ensureAudio();
 
-  if (!hoverVoice) hoverVoice = new Voice(ctx, out, frequencyFor(y), panFor(x), 0, clarityFor(y), HOVER_VOLUME);
-  else hoverVoice.update(frequencyFor(y), panFor(x), 0, clarityFor(y), HOVER_VOLUME);
+  // Drawing a connection between already-lit stars gets a slightly brighter,
+  // more smoothly-glided drone than plain ambient hover before any chain
+  // exists — the "physically drawing a musical phrase" feel from req 3.
+  const isDrawing = chainOrder.length > 0;
+  const hoverBrightness = isDrawing ? 0.15 : 0;
+  const hoverGlide = isDrawing ? 0.09 : 0.03;
+
+  if (!hoverVoice) {
+    hoverVoice = new Voice(ctx, out, frequencyFor(y), panFor(x), hoverBrightness, clarityFor(y), HOVER_VOLUME);
+  } else {
+    hoverVoice.update(frequencyFor(y), panFor(x), hoverBrightness, clarityFor(y), HOVER_VOLUME, hoverGlide);
+  }
 
   if (hoverIdleTimer !== null) clearTimeout(hoverIdleTimer);
   hoverIdleTimer = window.setTimeout(() => {

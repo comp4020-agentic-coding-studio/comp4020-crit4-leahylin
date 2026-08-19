@@ -93,6 +93,10 @@ main {
 .star {
   --size: 0.6;
   --amp: 0;
+  --rot: 0deg;
+  --ray-scale: 1;
+  --ray-gap: 90deg;
+  --glow: 1;
 
   position: absolute;
   transform: translate(-50%, -50%);
@@ -102,23 +106,23 @@ main {
   background: transparent;
   cursor: pointer;
   animation: dim-flicker 6s ease-in-out infinite;
-  filter: brightness(0.62) drop-shadow(0 0 3px rgb(255 214 150 / 30%));
+  filter: brightness(0.62) drop-shadow(0 0 calc(3px * var(--glow)) rgb(255 214 150 / 30%));
   transition: filter 300ms ease-out;
 }
 
 .star:hover {
-  filter: brightness(0.85) drop-shadow(0 0 5px rgb(255 214 150 / 45%));
+  filter: brightness(0.85) drop-shadow(0 0 calc(5px * var(--glow)) rgb(255 214 150 / 45%));
 }
 
-/* A star stays this dim, atmospheric sliver until the user actually clicks
+/* A star stays this dim, atmospheric shape until the user actually clicks
    or taps it — the constellation reveals itself one activation at a time. */
 .star.is-lit {
   animation: flicker 4s ease-in-out infinite;
-  filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+  filter: brightness(1.55) drop-shadow(0 0 calc(11px * var(--glow)) rgb(255 214 150 / 70%));
 }
 
 .star.is-lit:hover {
-  filter: brightness(1.8) drop-shadow(0 0 15px rgb(255 214 150 / 85%));
+  filter: brightness(1.8) drop-shadow(0 0 calc(15px * var(--glow)) rgb(255 214 150 / 85%));
 }
 
 /* One-shot radiating pulse the moment a star joins the chain, timed to match
@@ -131,18 +135,18 @@ main {
 @keyframes ignite-burst {
   0% {
     transform: translate(-50%, -50%) scale(1);
-    filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+    filter: brightness(1.55) drop-shadow(0 0 calc(11px * var(--glow)) rgb(255 214 150 / 70%));
     box-shadow: 0 0 0 0 rgb(255 224 170 / 55%);
   }
 
   30% {
     transform: translate(-50%, -50%) scale(1.55);
-    filter: brightness(2.6) drop-shadow(0 0 28px rgb(255 224 170 / 95%));
+    filter: brightness(2.6) drop-shadow(0 0 calc(28px * var(--glow)) rgb(255 224 170 / 95%));
   }
 
   100% {
     transform: translate(-50%, -50%) scale(1);
-    filter: brightness(1.55) drop-shadow(0 0 11px rgb(255 214 150 / 70%));
+    filter: brightness(1.55) drop-shadow(0 0 calc(11px * var(--glow)) rgb(255 214 150 / 70%));
     box-shadow: 0 0 0 26px rgb(255 224 170 / 0%);
   }
 }
@@ -154,18 +158,8 @@ main {
   pointer-events: none;
 }
 
-.star::before {
-  inset: -140%;
-  background: repeating-conic-gradient(
-    from 0deg,
-    rgb(255 224 158 / 85%) 0deg 0.6deg,
-    transparent 0.6deg 90deg
-  );
-  mask-image: radial-gradient(circle, #000 0%, transparent 60%);
-  transform: scale(calc(1 + var(--amp) * (0.5 + var(--size) * 0.9)));
-  transition: transform 60ms linear;
-}
-
+/* Shared default core glow — every variant starts from this soft point of
+   light; point/particle reshape it further below. */
 .star::after {
   inset: -35%;
   border-radius: 50%;
@@ -177,21 +171,101 @@ main {
     filter 60ms linear;
 }
 
+/* --- Inactive shape variants: four subtly different celestial silhouettes
+   (assigned per star in main.ts) so the resting sky reads as varied points
+   of light rather than identical dots. Each variant only reshapes
+   ::before/::after — brightness, twinkle, hover and the lit state below
+   stay shared so the visual hierarchy holds across all four. */
+
+.star-point::before {
+  content: none;
+}
+
+.star-point::after {
+  inset: calc(-18% * var(--ray-scale));
+}
+
+.star-particle::before {
+  content: none;
+}
+
+.star-particle::after {
+  inset: calc(-70% * var(--ray-scale));
+  background: radial-gradient(
+    circle,
+    rgb(255 239 210 / 85%) 0%,
+    rgb(255 214 150 / 50%) 35%,
+    rgb(255 184 82 / 0%) 75%
+  );
+  filter: blur(1.5px) brightness(calc(1 + var(--amp) * 1.8));
+}
+
+.star-burst::before {
+  inset: calc(-180% * var(--ray-scale));
+  background: repeating-conic-gradient(
+    from var(--rot),
+    rgb(255 228 168 / 92%) 0deg 1.6deg,
+    transparent 1.6deg var(--ray-gap)
+  );
+  mask-image: radial-gradient(circle, #000 0%, transparent 68%);
+  transform: scale(calc(1 + var(--amp) * (0.5 + var(--size) * 0.9)));
+  transition: transform 60ms linear;
+}
+
+.star-cross::before {
+  inset: calc(-220% * var(--ray-scale));
+  background: radial-gradient(circle, rgb(255 239 210 / 65%) 0%, rgb(255 214 150 / 35%) 40%, transparent 70%);
+  clip-path: polygon(
+    50% 0%,
+    58% 38%,
+    100% 50%,
+    58% 62%,
+    50% 100%,
+    42% 62%,
+    0% 50%,
+    42% 38%
+  );
+  transform: rotate(var(--rot)) scale(calc(1 + var(--amp) * (0.4 + var(--size) * 0.6)));
+}
+
 .star:focus-visible {
   outline: 2px solid #fff6d8;
   outline-offset: 4px;
 }
 
-.star.active::before {
-  background: repeating-conic-gradient(
-    from 0deg,
-    rgb(255 246 216 / 95%) 0deg 0.8deg,
-    transparent 0.8deg 90deg
-  );
-}
-
+/* A brief per-note brighten (any pluck — click, sequencer, hover, keys),
+   independent of persistent .is-lit — the core glows a touch whiter. */
 .star.active::after {
   background: radial-gradient(circle, #fff 0%, #fff2c9 40%, rgb(255 233 168 / 0%) 78%);
+}
+
+/* --- Illuminated state: whatever shape a star had while dim, being lit
+   converges every variant on the same bright, fuller starburst + glow — the
+   "waking star" moment reads consistently across the whole sky. A burst
+   variant's own --ray-gap carries through, so its point-count survives. */
+.star.is-lit::before {
+  content: "";
+  inset: calc(-160% * var(--ray-scale));
+  background: repeating-conic-gradient(
+    from var(--rot),
+    rgb(255 246 216 / 95%) 0deg 1.1deg,
+    transparent 1.1deg var(--ray-gap)
+  );
+  mask-image: radial-gradient(circle, #000 0%, transparent 60%);
+  clip-path: none;
+  filter: none;
+  transform: scale(calc(1 + var(--amp) * (0.5 + var(--size) * 0.9)));
+  transition: transform 60ms linear;
+}
+
+.star.is-lit::after {
+  inset: -45%;
+  background: radial-gradient(circle, #fff 0%, #fff2c9 40%, rgb(255 233 168 / 0%) 78%);
+  filter: brightness(calc(1 + var(--amp) * 1.8));
+}
+
+.star.is-lit.active::after {
+  background: radial-gradient(circle, #fff 0%, #fff 45%, rgb(255 246 216 / 0%) 80%);
 }
 
 @keyframes flicker {
